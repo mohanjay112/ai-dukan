@@ -3,6 +3,13 @@ import hmac
 import structlog
 from fastapi import APIRouter, HTTPException, Query, Request, Response  # add Query
 from app.infrastructure.config import settings
+from uuid import UUID
+from app.adapters.db.session import session_scope
+from app.adapters.db.models import Shop, WhatsAppMessage
+from app.core.repair.voice_intake import ingest_voice_note
+from sqlalchemy import select
+
+
 
 log = structlog.get_logger()
 router = APIRouter()
@@ -66,13 +73,34 @@ async def _handle_message(msg: dict, value: dict) -> None:
     log.info("whatsapp_message_received",
              type=msg_type, from_phone=from_phone, wa_msg_id=wa_msg_id)
 
-    if msg_type == "audio":
-        media_id = msg.get("audio", {}).get("id")
-        log.info("voice_note_received", media_id=media_id, from_phone=from_phone)
-        # TODO Day 5: download audio → R2 → queue transcription
-    elif msg_type == "text":
-        text = msg.get("text", {}).get("body", "")
-        log.info("text_message_received", text=text, from_phone=from_phone)
-        # TODO Day 8: handle text commands
-    else:
-        log.info("unhandled_message_type", msg_type=msg_type)
+    async with session_scope() as session:
+        # Look up the shop by owner phone
+        result = await session.execute(
+            select(Shop).where(Shop.owner_phone == from_phone, Shop.is_active == True)
+        )
+        shop = result.scalar_one_or_none()
+
+        # Persist the inbound message
+        session.add(WhatsAppMessage(
+            shop_id=shop.id if shop else None,
+            wa_message_id=wa_msg_id,
+            direction="inbound",
+            message_type=msg_type,
+            from_phone=from_phone,
+            body=msg.get("text", {}).get("body") if msg_type == "text" else None,
+            raw_payload=msg,
+            status="received",
+        ))
+
+        if not shop:
+            log.warning("unknown_sender", from_phone=from_phone)
+            return
+
+        if msg_type == "audio":
+            media_id = msg.get("audio", {}).get("id")
+            await ingest_voice_note(session, shop.id, media_id, from_phone)
+        elif msg_type == "text":
+            text = msg.get("text", {}).get("body", "")
+            log.info("text_message_received", text=text)
+        else:
+            log.info("unhandled_message_type", msg_type=msg_type)
